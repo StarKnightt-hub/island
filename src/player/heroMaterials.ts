@@ -22,6 +22,7 @@ const {
   float, vec3, vec4, mix, max, saturate, pow, sqrt, dot, normalize, smoothstep, texture, uv, uniform, varying,
   modelViewMatrix, tangentLocal, normalView, normalViewGeometry, positionViewDirection, diffuseColor, attribute,
   interleavedGradientNoise, screenCoordinate, luminance, specularColor, specularColorBlended, specularF90, reflect,
+  hash, floor, abs, clamp,
 } = TSL;
 
 export const heroU = {
@@ -365,16 +366,58 @@ export function skinMaterial(map: THREE.Texture, normalMap: THREE.Texture | null
   const hair = isHead
     ? saturate(float(0.06).sub(luminance(alb.rgb)).div(0.04)).mul(saturate(warm.sub(0.1).div(0.15))).mul(smoothstep(0.62, 0.58, t.y))
     : float(0);
+  const rest = attribute('heroRestPosition', 'vec3');
+  let color = alb.rgb;
+  let gear: N = float(0);
+  if (isHead) {
+    // Fine, sparse follicle marks along the jaw and upper lip make the adult face read as short natural stubble.
+    const beardLine = smoothstep(0.81, 0.76, rest.y).mul(smoothstep(0.62, 0.67, rest.y));
+    const front = smoothstep(0.025, 0.075, rest.z);
+    const cheeks = smoothstep(0.135, 0.075, abs(rest.x));
+    const cells = floor(rest.x.mul(520)).add(floor(rest.y.mul(690)).mul(61)).add(floor(rest.z.mul(430)).mul(131));
+    const follicles = smoothstep(0.69, 0.94, hash(cells));
+    const stubble = skin.mul(beardLine).mul(front).mul(cheeks).mul(follicles).mul(0.34);
+    color = mix(color, color.mul(vec3(0.36, 0.27, 0.2)), stubble);
+  } else {
+    // The model's atlas already carries scanned folds. Regrade its shirt and shorts into a fitted field shirt and
+    // practical earth-tone trousers, retaining those folds as luminance instead of flattening the texture.
+    const rect = (u0: number, u1: number, v0: number, v1: number) =>
+      smoothstep(u0, u0 + 0.004, t.x)
+        .mul(float(1).sub(smoothstep(u1 - 0.004, u1, t.x)))
+        .mul(smoothstep(v0, v0 + 0.004, t.y))
+        .mul(float(1).sub(smoothstep(v1 - 0.004, v1, t.y)));
+    const shirt = saturate(rect(0.317, 0.684, 0.126, 0.98).add(rect(0, 0.312, 0.37, 0.57)).add(rect(0.688, 1, 0.37, 0.57)));
+    const shortPanels = saturate(rect(0, 0.293, 0.746, 1).add(rect(0.703, 1, 0.746, 1)));
+    const boots = saturate(rect(0.205, 0.43, 0, 0.307).add(rect(0.586, 0.811, 0, 0.307)));
+    const lum = luminance(alb.rgb);
+    const shirtTone = vec3(0.075, 0.13, 0.091).mul(clamp(lum.div(0.19), 0.55, 1.38));
+    const trouserTone = vec3(0.115, 0.083, 0.047).mul(clamp(lum.div(0.07), 0.55, 1.42));
+    const bootTone = vec3(0.052, 0.031, 0.016).mul(clamp(lum.div(0.24), 0.5, 1.35));
+    color = mix(color, shirtTone, shirt);
+    color = mix(color, trouserTone, shortPanels);
+    color = mix(color, bootTone, boots);
+
+    // Extend the trouser cloth over the exposed lower-leg texture, using the original bind-pose coordinates so the
+    // hem stays stable while the legs animate. Hands and the upper body are outside this narrow lower-body mask.
+    const legs = skin.mul(smoothstep(-0.08, -0.24, rest.y)).mul(smoothstep(0.28, 0.16, abs(rest.x)));
+    const legTone = vec3(0.115, 0.083, 0.047).mul(clamp(lum.div(0.32), 0.68, 1.28));
+    color = mix(color, legTone, legs);
+    gear = saturate(shirt.add(shortPanels).add(boots).add(legs));
+
+    // Low-amplitude woven grain catches highlights on the cloth without adding another texture lookup.
+    const grain = hash(floor(t.x.mul(640)).add(floor(t.y.mul(640)).mul(127)));
+    color = color.mul(mix(float(1), mix(float(0.975), float(1.025), grain), gear));
+  }
   const wet = heroU.wet;
   // wet: skin a little darker, cloth and hair much darker (water fills the weave)
   const dry = mix(mix(float(0.62), float(0.86), skin), float(0.55), hair);
-  m.colorNode = vec4(alb.rgb.mul(mix(float(1), dry, wet)), 1);
+  m.colorNode = vec4(color.mul(mix(float(1), dry, wet)), 1);
   if (normalMap) m.normalMap = normalMap;
   const rough = mix(mix(float(0.86), float(0.48), skin), float(0.8), hair);
   const roughWet = mix(mix(float(0.42), float(0.26), skin), float(0.3), hair);
-  m.roughnessNode = mix(mix(rough, roughWet, wet), float(0.07), eye);
+  m.roughnessNode = mix(mix(mix(rough, roughWet, wet), float(0.07), eye), mix(float(0.88), float(0.68), wet), gear);
   m.metalness = 0;
-  m.f0 = vec3(mix(mix(mix(float(0.04), float(0.028), skin), float(0.012), hair), float(0.03), eye));
+  m.f0 = vec3(mix(mix(mix(mix(float(0.04), float(0.028), skin), float(0.012), hair), float(0.03), eye), float(0.04), gear));
   m.skin = { skin, eye };
   return m;
 }

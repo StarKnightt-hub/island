@@ -19,17 +19,32 @@ export interface Intent {
   worldYaw?: number;
 }
 
+export type TouchControl = 'move' | 'look' | 'sprint' | 'jump';
+
+interface TouchPointer {
+  control: TouchControl;
+  x: number;
+  y: number;
+  moveX: number;
+  moveY: number;
+}
+
 export class Input {
   private keys = new Set<string>();
   private pressed = new Set<string>();
   private mdx = 0;
   private mdy = 0;
   private wheel = 0;
+  private touchPointers = new Map<number, TouchPointer>();
+  private touchLookX = 0;
+  private touchLookY = 0;
+  private touchJumpHit = false;
   locked = false;
   /** scripted control (harness `act`): overrides the devices while > 0 */
   scripted: { t: number; intent: Partial<Intent> } | null = null;
   readonly canvas: HTMLCanvasElement;
   sensitivity = 0.0022;
+  private readonly touchSensitivity = 0.008;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -40,7 +55,10 @@ export class Input {
       if (['Space', 'Tab'].includes(e.code)) e.preventDefault();
     });
     window.addEventListener('keyup', (e) => this.keys.delete(e.code));
-    window.addEventListener('blur', () => this.keys.clear());
+    window.addEventListener('blur', () => {
+      this.keys.clear();
+      this.clearTouches();
+    });
     canvas.addEventListener('click', () => {
       if (!params.test && document.pointerLockElement !== canvas) canvas.requestPointerLock?.();
     });
@@ -63,15 +81,58 @@ export class Input {
     return this.frameHits.has(code);
   }
 
+  touchStart(pointerId: number, control: TouchControl, x: number, y: number) {
+    if (this.touchPointers.has(pointerId)) return;
+    const jumpAlreadyHeld = [...this.touchPointers.values()].some((p) => p.control === 'jump');
+    this.touchPointers.set(pointerId, { control, x, y, moveX: 0, moveY: 0 });
+    if (control === 'jump' && !jumpAlreadyHeld) this.touchJumpHit = true;
+  }
+
+  touchMove(pointerId: number, x: number, y: number, moveX = 0, moveY = 0) {
+    const pointer = this.touchPointers.get(pointerId);
+    if (!pointer) return;
+    if (pointer.control === 'look' || pointer.control === 'sprint') {
+      this.touchLookX += (x - pointer.x) * this.touchSensitivity;
+      this.touchLookY -= (y - pointer.y) * this.touchSensitivity;
+    } else if (pointer.control === 'move') {
+      pointer.moveX = moveX;
+      pointer.moveY = moveY;
+    }
+    pointer.x = x;
+    pointer.y = y;
+  }
+
+  touchEnd(pointerId: number) {
+    this.touchPointers.delete(pointerId);
+  }
+
+  clearTouches() {
+    this.touchPointers.clear();
+    this.touchLookX = 0;
+    this.touchLookY = 0;
+    this.touchJumpHit = false;
+  }
+
   read(dt: number): Intent {
     const k = (c: string) => this.keys.has(c);
     let mx = (k('KeyD') || k('ArrowRight') ? 1 : 0) - (k('KeyA') || k('ArrowLeft') ? 1 : 0);
     let my = (k('KeyW') || k('ArrowUp') ? 1 : 0) - (k('KeyS') || k('ArrowDown') ? 1 : 0);
     let lx = this.mdx * this.sensitivity, ly = this.mdy * this.sensitivity;
     let sprint = k('ShiftLeft') || k('ShiftRight');
-    let jump = this.pressed.has('Space');
+    let jump = this.pressed.has('Space') || this.touchJumpHit;
     const walk = k('ControlLeft') || k('KeyC');
     let up = (k('KeyE') ? 1 : 0) - (k('KeyQ') ? 1 : 0);
+    for (const pointer of this.touchPointers.values()) {
+      if (pointer.control === 'move') {
+        mx += pointer.moveX;
+        my += pointer.moveY;
+      } else if (pointer.control === 'sprint') sprint = true;
+    }
+    lx += this.touchLookX;
+    ly += this.touchLookY;
+    this.touchLookX = 0;
+    this.touchLookY = 0;
+    this.touchJumpHit = false;
     // gamepad
     const pads = navigator.getGamepads?.() ?? [];
     for (const gp of pads) {

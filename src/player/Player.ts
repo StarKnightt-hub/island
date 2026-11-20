@@ -11,9 +11,9 @@ import { loadGLTF } from '../core/Assets';
 import { SPOTS } from '../world/layout';
 import { uniform, float, vec4, uv, pow, clamp } from '../core/tsl';
 import { heroU, hairMaterial, prepareHairGeometry, skinMaterial, smoothSeams } from './heroMaterials';
+import { addAdventurerDetails } from './AdventurerDetails';
 import { Footprints, printU } from './Footprints';
 import { PoseLayer } from './PoseLayer';
-import { attachStrawHat } from './StrawHat';
 import { SandPuffs } from './SandPuffs';
 import { WadeFx } from './WadeFx';
 import { atmo } from '../sky/Atmosphere';
@@ -26,6 +26,7 @@ const WALK = 1.35, RUN = 4.1, SPRINT = 6.6, SWIM = 1.35, SWIM_FAST = 2.1;
 const STRIDE = { walk: 0.952 * 1.333, jog: 5.229 * 0.933, sprint: 8.053 * 0.667 };
 const GRAVITY = 16;
 const JUMP_V = 5.4;
+const JUMP_COOLDOWN = 0.18;
 const MAX_SLOPE = Math.cos((40 * Math.PI) / 180);
 /** depth of water (surface - ground) at which wading turns into swimming */
 const SWIM_DEPTH = 1.32;
@@ -49,6 +50,7 @@ export class Player {
   private airTime = 0;
   private landT = 0;
   private jumpT = -1;
+  private jumpCooldown = 0;
   private lastFootPhase = 0;
   surface: Surface = 'sand';
   waterDepth = 0;
@@ -110,6 +112,10 @@ export class Player {
     if (hair && head) prepareHairGeometry(hair.geometry, head.geometry);
     for (const [part, m] of [['body', body], ['head', head]] as const) {
       if (!m) continue;
+      const p = m.geometry.getAttribute('position');
+      const rest = new Float32Array(p.count * 3);
+      for (let i = 0; i < p.count; i++) rest.set([p.getX(i), p.getY(i), p.getZ(i)], i * 3);
+      m.geometry.setAttribute('heroRestPosition', new THREE.BufferAttribute(rest, 3));
       const src = m.material as THREE.MeshStandardMaterial;
       if (src.map) m.material = skinMaterial(src.map, src.normalMap, part);
     }
@@ -119,8 +125,24 @@ export class Player {
       // the hair's shadow on the scalp and neck: one-sided cut-out, a little behind its own surface
       hair.castShadow = true;
     }
-    if (head) attachStrawHat(this.model, head as THREE.SkinnedMesh, hair as THREE.SkinnedMesh | null);
     this.root.add(this.model);
+    // Enlarge only the rendered rig. Collision, movement, and the player's root remain at their original size.
+    this.model.scale.setScalar(1.14);
+    this.model.updateMatrixWorld(true);
+    if (body) {
+      const inv = this.model.matrixWorld.clone().invert();
+      const p = new THREE.Vector3();
+      let lowest = Infinity;
+      for (let i = 0; i < body.geometry.getAttribute('position').count; i++) {
+        (body as THREE.SkinnedMesh).getVertexPosition(i, p);
+        p.applyMatrix4(body.matrixWorld).applyMatrix4(inv);
+        lowest = Math.min(lowest, p.y);
+      }
+      // Keep the boot soles on the same ground point after scaling the visual model.
+      if (Number.isFinite(lowest)) this.model.position.y = -lowest * this.model.scale.y;
+      this.model.updateMatrixWorld(true);
+    }
+    if (head) addAdventurerDetails(this.model, body as THREE.SkinnedMesh | null, head as THREE.SkinnedMesh, hair as THREE.SkinnedMesh | null);
     this.contact = new ContactShadows(this.model);
     this.shadows.add(this.contact.group);
     const bone = (n: string) => {
@@ -153,6 +175,7 @@ export class Player {
     this.moveA = heading;
     this.bank = 0;
     this.crouchT = -1;
+    this.jumpCooldown = 0;
     this.state = 'ground';
     this.updateWater();
     if (this.waterDepth > SWIM_DEPTH) {
@@ -202,6 +225,7 @@ export class Player {
 
   update(dt: number, intent: Intent, camYaw: number) {
     if (!this.ready) return;
+    this.jumpCooldown = Math.max(0, this.jumpCooldown - dt);
     const refYaw = intent.worldYaw ?? camYaw;
     const fwdX = Math.sin(refYaw), fwdZ = -Math.cos(refYaw);
     const rightX = Math.cos(refYaw), rightZ = Math.sin(refYaw);
@@ -314,7 +338,9 @@ export class Player {
       if (intent.jump) this.vel.y = 0;
     } else if (this.state === 'ground') {
       // a jump crouches first (a few frames of anticipation), then leaves the ground
-      if (intent.jump && this.waterDepth < 0.7 && this.crouchT < 0) this.crouchT = 0;
+      const supported = g.y >= this.pos.y - 0.55;
+      if (!supported) this.crouchT = -1;
+      if (intent.jump && supported && this.jumpCooldown <= 0 && this.waterDepth < 0.7 && this.crouchT < 0) this.crouchT = 0;
       if (this.crouchT >= 0) {
         this.crouchT += dt;
         const dur = this.speed > 3 ? 0.07 : 0.13;
@@ -354,6 +380,7 @@ export class Player {
         const impact = -this.vel.y;
         this.vel.y = 0;
         this.state = 'ground';
+        this.jumpCooldown = JUMP_COOLDOWN;
         this.landT = impact > 3.5 ? 0.0001 : -1;
         this.step({ surface: this.surfaceUnderfoot(g.surf), speed: Math.max(3, impact), foot: 0, pos: this.pos }, true);
       }

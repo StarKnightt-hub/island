@@ -204,7 +204,7 @@ async function boot() {
   }
 
   engine.setupPost();
-  const hud = new Hud(params.hud);
+  const hud = new Hud(params.hud, input);
   const dbg = new DebugOverlay({
     adapter: gpuName || engine.adapterInfo.description || engine.adapterInfo.vendor || 'unknown GPU',
     backend: engine.backendName,

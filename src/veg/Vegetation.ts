@@ -61,8 +61,10 @@ interface Species {
   inst: Float32Array;
   count: number;
   cells: Map<number, number[]>;
-  meshes: { lod: number; mesh: THREE.InstancedMesh; data: THREE.InstancedBufferAttribute }[][];
+  meshes: { lod: number; mesh: THREE.InstancedMesh; data: THREE.InstancedBufferAttribute; fade: THREE.InstancedBufferAttribute }[][];
   radius: number;
+  /** cross-fade the helper-GLB LODs over a narrow band around each switch distance */
+  fadeLods?: boolean;
   /** how far an instance may reach out of its 32 m cell (scaled instances reach further than `radius`) */
   pad: number;
   /** lie on the slope (flat ground covers such as leaf litter) instead of standing upright */
@@ -199,6 +201,9 @@ export class Vegetation {
     await Promise.all(Object.entries(files).map(async ([key, [url, srgb]]) => {
       const t = configureTex(await loadKTX2(url), srgb);
       t.wrapS = t.wrapT = key === 'palm_bark' || key === 'bark' ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping;
+      t.minFilter = THREE.LinearMipmapLinearFilter;
+      t.magFilter = THREE.LinearFilter;
+      t.generateMipmaps = false;
       for (const n of this.texNodes[key] ?? []) n.value = t;
     }));
   }
@@ -228,12 +233,14 @@ export class Vegetation {
       // again in full in every render pass of every frame, ~15 MB a frame across the island's instanced meshes)
       const matrix = new THREE.InstancedBufferAttribute(new Float32Array(cap * 16), 16);
       const data = new THREE.InstancedBufferAttribute(new Float32Array(cap * 4), 4);
+      const fade = new THREE.InstancedBufferAttribute(new Float32Array(cap), 1);
       const row: Species['meshes'][number] = [];
       for (const part of lod.parts) {
         const g = new THREE.BufferGeometry();
         for (const [k, a] of Object.entries(part.geometry.attributes)) g.setAttribute(k, a);
         g.setIndex(part.geometry.index);
         g.setAttribute('iData', data);
+        g.setAttribute('lodFade', fade);
         const mat = part.material ?? (part.part === 'leaf' && name_isBush(sp.name) ? this.mats.bushleaf : this.mats[part.part]);
         const mesh = new THREE.InstancedMesh(g, mat, cap);
         mesh.instanceMatrix = matrix;
@@ -247,7 +254,7 @@ export class Vegetation {
         mesh.renderOrder = l - 4;
         mesh.name = `${sp.name}_l${l}_${part.part}`;
         this.group.add(mesh);
-        row.push({ lod: l, mesh, data });
+        row.push({ lod: l, mesh, data, fade });
       }
       sp.meshes.push(row);
     }
@@ -310,6 +317,7 @@ export class Vegetation {
     const reach = Math.max(v.height, v.radius) * (opts.maxScale ?? 1.25);
     const sp = this.addSpecies(v.name, lods, Math.max(v.height, v.radius * 2), reach);
     sp.tilt = opts.tilt;
+    sp.fadeLods = true;
     return sp;
   }
 
@@ -819,8 +827,39 @@ export class Vegetation {
       const caps = sp.meshes.map((row) => row[0].data.count);
       const mats = sp.meshes.map((row) => row[0].mesh.instanceMatrix.array as Float32Array);
       const datas = sp.meshes.map((row) => row[0].data.array as Float32Array);
+      const fades = sp.meshes.map((row) => row[0].fade.array as Float32Array);
       const lim2 = sp.lods.map((l) => l.maxDist * l.maxDist);
       const small = sp.radius < 1.5;
+      let writeX = 0, writeY = 0, writeZ = 0, writeYaw = 0, writeScale = 1, writePhase = 0, writeD2 = 0;
+      const emit = (l: number, coverage: number) => {
+        const k = counts[l];
+        if (k >= caps[l]) return;
+        counts[l] = k + 1;
+        fades[l][k] = coverage;
+        const s = writeScale, yaw = writeYaw;
+        const c = Math.cos(yaw) * s, sn = Math.sin(yaw) * s;
+        const m = mats[l], b = k * 16;
+        if (sp.tilt) {
+          const nrm = this.hf.normal(writeX, writeZ);
+          const up = this.tmpUp.set(nrm.x, nrm.y, nrm.z);
+          const ax = this.tmpAx.set(Math.cos(yaw), 0, -Math.sin(yaw));
+          const az = this.tmpAz.crossVectors(ax, up).normalize();
+          ax.crossVectors(up, az);
+          m[b] = ax.x * s; m[b + 1] = ax.y * s; m[b + 2] = ax.z * s; m[b + 3] = 0;
+          m[b + 4] = up.x * s; m[b + 5] = up.y * s; m[b + 6] = up.z * s; m[b + 7] = 0;
+          m[b + 8] = az.x * s; m[b + 9] = az.y * s; m[b + 10] = az.z * s; m[b + 11] = 0;
+        } else {
+          m[b] = c; m[b + 1] = 0; m[b + 2] = -sn; m[b + 3] = 0;
+          m[b + 4] = 0; m[b + 5] = s; m[b + 6] = 0; m[b + 7] = 0;
+          m[b + 8] = sn; m[b + 9] = 0; m[b + 10] = c; m[b + 11] = 0;
+        }
+        m[b + 12] = writeX; m[b + 13] = writeY; m[b + 14] = writeZ; m[b + 15] = 1;
+        const da = datas[l], q = k * 4;
+        da[q] = yaw;
+        da[q + 1] = writePhase;
+        da[q + 2] = s;
+        da[q + 3] = writeD2;
+      };
       const ci0 = Math.floor((cx - maxD + HALF_WORLD) / CELL), ci1 = Math.floor((cx + maxD + HALF_WORLD) / CELL);
       const cj0 = Math.floor((cz - maxD + HALF_WORLD) / CELL), cj1 = Math.floor((cz + maxD + HALF_WORLD) / CELL);
       for (let ci = Math.max(0, ci0); ci <= Math.min(63, ci1); ci++) for (let cj = Math.max(0, cj0); cj <= Math.min(63, cj1); cj++) {
